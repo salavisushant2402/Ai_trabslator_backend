@@ -6,16 +6,7 @@ import OpenAI from "openai";
 dotenv.config();
 
 const app = express();
-app.use(cors({
-  origin: [
-    "http://localhost:8080",
-    "http://localhost:5173",
-    "https://ai-ui-demo-taupe.vercel.app/"
-  ],
-  methods: ["GET", "POST"],
-  allowedHeaders: ["Content-Type"],
-}));
-
+app.use(cors());
 app.use(express.json());
 
 const client = new OpenAI({
