@@ -164,6 +164,72 @@ function getUniversalPrompt(targetLanguage, text) {
   return { systemPrompt, userPrompt };
 }
 
+app.post("/detect-language", async (req, res) => {
+  try {
+    const { text } = req.body;
+
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: "Text is required" });
+    }
+
+    const supportedList = Object.keys(SUPPORTED_LANGUAGES);
+
+    const response = await client.chat.completions.create({
+      model: "llama-3.1-8b-instant",
+      temperature: 0.0,
+      max_tokens: 100,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: `
+            You are a professional language detection engine.
+
+            STRICT RULES:
+            - Detect the exact language of the user text.
+            - Only choose from this list:
+            ${supportedList.join(", ")}
+
+            - If none match confidently, return "Unknown".
+            - Return ONLY valid JSON.
+            - No explanation.
+
+            Format:
+            {
+              "language": "English"
+            }
+          `,
+        },
+        {
+          role: "user",
+          content: text,
+        },
+      ],
+    });
+
+    const parsed = JSON.parse(response.choices[0].message.content);
+
+    const detected = parsed.language;
+
+    const isSupported =
+      Object.prototype.hasOwnProperty.call(
+        SUPPORTED_LANGUAGES,
+        detected
+      );
+
+    res.json({
+      language: detected,
+      supported: isSupported,
+      nativeName: isSupported
+        ? SUPPORTED_LANGUAGES[detected].nativeName
+        : null,
+    });
+  } catch (error) {
+    console.error("LLM Language detection error:", error);
+    res.status(500).json({ error: "Language detection failed" });
+  }
+});
+
 app.post("/translate", async (req, res) => {
   try {
     const { text, targetLanguage, sourceLanguage } = req.body;
