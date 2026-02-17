@@ -126,47 +126,64 @@ app.post("/detect-language", async (req, res) => {
       return res.status(400).json({ error: "Text is required" });
     }
 
-    // Detect language using franc
-    const iso3Code = franc(text, { minLength: 3 });
+    const supportedList = Object.keys(SUPPORTED_LANGUAGES);
 
-    if (iso3Code === "und") {
-      return res.json({
-        language: "Unknown",
-        supported: false,
-        nativeName: null,
-      });
-    }
+    const response = await client.chat.completions.create({
+      model: "llama-3.1-8b-instant",
+      temperature: 0.0,
+      max_tokens: 100,
+      response_format: { type: "json_object" }, // 🔥 forces JSON
+      messages: [
+        {
+          role: "system",
+          content: `
+You are a professional language detection engine.
 
-    // Convert ISO 639-3 to full language name
-    const languageData = langs.where("3", iso3Code);
+STRICT RULES:
+- Detect the exact language of the user text.
+- Only choose from this list:
+${supportedList.join(", ")}
 
-    if (!languageData) {
-      return res.json({
-        language: "Unknown",
-        supported: false,
-        nativeName: null,
-      });
-    }
+- If none match confidently, return "Unknown".
+- Return ONLY valid JSON.
+- No explanation.
 
-    const detectedLanguage = languageData.name;
+Format:
+{
+  "language": "English"
+}
+          `,
+        },
+        {
+          role: "user",
+          content: text,
+        },
+      ],
+    });
 
-    const isSupported = Object.prototype.hasOwnProperty.call(
-      SUPPORTED_LANGUAGES,
-      detectedLanguage
-    );
+    const parsed = JSON.parse(response.choices[0].message.content);
+
+    const detected = parsed.language;
+
+    const isSupported =
+      Object.prototype.hasOwnProperty.call(
+        SUPPORTED_LANGUAGES,
+        detected
+      );
 
     res.json({
-      language: detectedLanguage,
+      language: detected,
       supported: isSupported,
       nativeName: isSupported
-        ? SUPPORTED_LANGUAGES[detectedLanguage].nativeName
+        ? SUPPORTED_LANGUAGES[detected].nativeName
         : null,
     });
   } catch (error) {
-    console.error("Language detection error:", error);
+    console.error("LLM Language detection error:", error);
     res.status(500).json({ error: "Language detection failed" });
   }
 });
+
 
 
 // POST /translate - Teamcenter & Technical Software Optimized
