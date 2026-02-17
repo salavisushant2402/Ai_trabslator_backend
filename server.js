@@ -2,6 +2,10 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
+import { GoogleGenAI } from "@google/genai";
+import { franc } from "franc";
+import langs from "langs";
+
 
 dotenv.config();
 
@@ -12,6 +16,10 @@ app.use(express.json());
 const client = new OpenAI({
   apiKey: process.env.GROQ_API_KEY,
   baseURL: "https://api.groq.com/openai/v1",
+});
+
+const gemini = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY,
 });
 
 const SUPPORTED_LANGUAGES = {
@@ -118,47 +126,44 @@ app.post("/detect-language", async (req, res) => {
       return res.status(400).json({ error: "Text is required" });
     }
 
-    const response = await client.chat.completions.create({
-      model: "llama-3.1-8b-instant",
-      temperature: 0.0,
-      messages: [
-        {
-          role: "system",
-          content: `
-            You are a professional language detection engine.
-            STRICT RULES:
-            - Detect the EXACT language of the text.
-            - DO NOT guess.
-            - DO NOT choose closest language.
-            - DO NOT explain.
-            - DO NOT add extra words.
-            - Return ONLY the full English name of the detected language.
-            - If the language cannot be confidently identified, return: Unknown
-          `,
-        },
-        {
-          role: "user",
-          content: text,
-        },
-      ],
-    });
+    // Detect language using franc
+    const iso3Code = franc(text, { minLength: 3 });
 
-    const detected = response.choices[0].message.content.trim();
+    if (iso3Code === "und") {
+      return res.json({
+        language: "Unknown",
+        supported: false,
+        nativeName: null,
+      });
+    }
+
+    // Convert ISO 639-3 to full language name
+    const languageData = langs.where("3", iso3Code);
+
+    if (!languageData) {
+      return res.json({
+        language: "Unknown",
+        supported: false,
+        nativeName: null,
+      });
+    }
+
+    const detectedLanguage = languageData.name;
 
     const isSupported = Object.prototype.hasOwnProperty.call(
       SUPPORTED_LANGUAGES,
-      detected
+      detectedLanguage
     );
 
     res.json({
-      language: detected,
+      language: detectedLanguage,
       supported: isSupported,
       nativeName: isSupported
-        ? SUPPORTED_LANGUAGES[detected].nativeName
+        ? SUPPORTED_LANGUAGES[detectedLanguage].nativeName
         : null,
     });
   } catch (error) {
-    console.error(error);
+    console.error("Language detection error:", error);
     res.status(500).json({ error: "Language detection failed" });
   }
 });
@@ -274,6 +279,178 @@ app.post("/translate", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Translation failed" });
+  }
+});
+
+app.post("/similarity_index", async (req, res) => {
+  try {
+    const { text, targetLanguage, sourceLanguage } = req.body;
+
+    if (!text) {
+      return res.status(400).json({ error: "Text is required" });
+    }
+
+    const sourceLang = sourceLanguage || "English";
+    const results = {};
+
+    let totalLLM1Score = 0;
+    let totalLLM2Score = 0;
+    let llm1Wins = 0;
+    let llm2Wins = 0;
+    let evaluatedCount = 0;
+
+    for (const language of Object.keys(SUPPORTED_LANGUAGES)) {
+      try {
+        const { nativeName } = SUPPORTED_LANGUAGES[language];
+        const llm1Response = await client.chat.completions.create({
+          model: "llama-3.1-8b-instant",
+          temperature: 0.0,
+          messages: [
+            {
+              role: "system",
+              content: `Translate into ${language} (${nativeName}). Return ONLY translation.`,
+            },
+            { role: "user", content: text },
+          ],
+        });
+
+        const llm1Translation = llm1Response.choices[0].message.content.trim();
+        const llm2Response = await gemini.models.generateContent({
+          model: "gemini-2.0-flash",
+          generationConfig: { temperature: 0.0 },
+          contents: `Translate into ${language}. Return ONLY translation.\n\nText:\n${text}`,
+        });
+
+        const llm2Translation = llm2Response.text.trim();
+        const swap = Math.random() > 0.5;
+
+        const translationA = swap ? llm1Translation : llm2Translation;
+        const translationB = swap ? llm2Translation : llm1Translation;
+
+        const evaluationResponse =
+          await gemini.models.generateContent({
+            model: "gemini-2.0-flash",
+            generationConfig: { temperature: 0.0 },
+            contents: `
+              You are a neutral professional translation evaluator.
+
+              Original Text:
+              ${text}
+
+              Translation A:
+              ${translationA}
+
+              Translation B:
+              ${translationB}
+
+              Evaluate both translations based on:
+              - Meaning preservation
+              - Fluency
+              - Accuracy
+              - Naturalness
+
+              Return ONLY valid JSON:
+              {
+                "scoreA": number (0-100),
+                "scoreB": number (0-100),
+                "semanticSimilarity": number (0-100),
+                "winner": "A or B",
+                "reasoning": "brief explanation"
+              }`
+          });
+
+        let evaluationText = evaluationResponse.text.trim();
+
+        if (evaluationText.startsWith("```")) {
+          evaluationText = evaluationText
+            .replace(/```json|```/g, "")
+            .trim();
+        }
+
+        const evaluation = JSON.parse(evaluationText);
+        const llm1Score = swap
+          ? evaluation.scoreA
+          : evaluation.scoreB;
+
+        const llm2Score = swap
+          ? evaluation.scoreB
+          : evaluation.scoreA;
+
+        totalLLM1Score += llm1Score;
+        totalLLM2Score += llm2Score;
+
+        if (
+          (swap && evaluation.winner === "A") ||
+          (!swap && evaluation.winner === "B")
+        ) {
+          llm1Wins++;
+        } else {
+          llm2Wins++;
+        }
+
+        evaluatedCount++;
+
+        results[language] = {
+          LLM1_translation: llm1Translation,
+          LLM2_translation: llm2Translation,
+          LLM1_score: llm1Score,
+          LLM2_score: llm2Score,
+          semanticSimilarity: evaluation.semanticSimilarity,
+          winner:
+            llm1Score > llm2Score
+              ? "LLM1"
+              : llm2Score > llm1Score
+              ? "LLM2"
+              : "Tie",
+          reasoning: evaluation.reasoning,
+        };
+      } catch (err) {
+        results[language] = { error: true };
+      }
+    }
+
+    const averageLLM1 =
+      evaluatedCount > 0 ? totalLLM1Score / evaluatedCount : 0;
+
+    const averageLLM2 =
+      evaluatedCount > 0 ? totalLLM2Score / evaluatedCount : 0;
+
+    const llm1WinRate =
+      evaluatedCount > 0
+        ? (llm1Wins / evaluatedCount) * 100
+        : 0;
+
+    const llm2WinRate =
+      evaluatedCount > 0
+        ? (llm2Wins / evaluatedCount) * 100
+        : 0;
+
+    const finalWinner =
+      averageLLM1 > averageLLM2
+        ? "LLM1 (llama-3.1-8b-instant)"
+        : averageLLM2 > averageLLM1
+        ? "LLM2 (gemini-2.0-flash)"
+        : "Tie";
+
+    res.json({
+      sourceLanguage: sourceLang,
+      targetLanguage,
+
+      modelPerformance: {
+        LLM1_averageScore: Number(averageLLM1.toFixed(2)),
+        LLM2_averageScore: Number(averageLLM2.toFixed(2)),
+        LLM1_winRate: Number(llm1WinRate.toFixed(2)),
+        LLM2_winRate: Number(llm2WinRate.toFixed(2)),
+        winner: finalWinner,
+      },
+      totalLanguagesEvaluated: evaluatedCount,
+      allLanguageResults: results,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "Fair translation evaluation failed",
+    });
   }
 });
 
