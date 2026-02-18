@@ -269,52 +269,6 @@ app.post("/translate", async (req, res) => {
   }
 });
 
-app.post("/similarity_index", async (req, res) => {
-  try {
-    const { text } = req.body;
-    const results = {};
-
-    for (const language of Object.keys(SUPPORTED_LANGUAGES)) {
-
-      const { systemPrompt, userPrompt } = getUniversalPrompt(language, text);
-
-      const llm1Response = await client.chat.completions.create({
-        model: "llama-3.1-8b-instant",
-        temperature: 0,
-        top_p: 1,
-        frequency_penalty: 0,
-        presence_penalty: 0,
-        seed: 42,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-      });
-
-      const llm1Translation = llm1Response.choices[0].message.content.trim();
-
-      const llm2Response = await gemini.models.generateContent({
-        model: "gemini-2.0-flash",
-        generationConfig: { temperature: 0.0 },
-        contents: systemPrompt + "\n\n" + text,
-      });
-
-      const llm2Translation = llm2Response.text.trim();
-
-      results[language] = {
-        LLM1_translation: llm1Translation,
-        LLM2_translation: llm2Translation,
-      };
-    }
-
-    res.json({ results });
-
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Fair translation evaluation failed" });
-  }
-});
-
 
 app.post("/translate_to_check", async (req, res) => {
   try {
@@ -337,32 +291,27 @@ app.post("/translate_to_check", async (req, res) => {
       text
     );
 
-    const detectionResponse =
-      await gemini.models.generateContent({
-        model: "gemini-2.0-flash",
-        generationConfig: {
-          temperature: 0.0,
-          responseMimeType: "application/json",
-        },
-        contents: `
-        Detect the exact language of this text.
+    // Detect Source Language (Gemini)
+    const detectionResponse = await gemini.models.generateContent({
+      model: "gemini-2.0-flash",
+      generationConfig: {
+        temperature: 0,
+        responseMimeType: "application/json",
+      },
+      contents: `
+        Detect the exact language.
         Return ONLY JSON:
         { "language": "English" }
-
         Text:
-        ${text}`,
-    });
-
+        ${text}`,});
     const detectedLang = JSON.parse(
       detectionResponse.text.replace(/```json|```/g, "").trim()
     ).language;
 
-    const llm1Response = await client.chat.completions.create({
+    // Forward Translation
+    const llamaForward = await client.chat.completions.create({
       model: "llama-3.1-8b-instant",
       temperature: 0,
-      top_p: 1,
-      frequency_penalty: 0,
-      presence_penalty: 0,
       seed: 42,
       messages: [
         { role: "system", content: systemPrompt },
@@ -370,96 +319,176 @@ app.post("/translate_to_check", async (req, res) => {
       ],
     });
 
-    const llm1Translation = llm1Response.choices[0].message.content.trim();
+    const llamaTranslation =
+      llamaForward.choices[0].message.content.trim();
 
-    const llm2Response =
-      await gemini.models.generateContent({
-        model: "gemini-2.0-flash",
-        generationConfig: { temperature: 0.0 },
-        contents: systemPrompt + "\n\n" + text,
-      });
+    const geminiForward = await gemini.models.generateContent({
+      model: "gemini-2.0-flash",
+      generationConfig: { temperature: 0 },
+      contents: systemPrompt + "\n\n" + text,
+    });
 
-    const llm2Translation = llm2Response.text.trim();
+    const geminiTranslation = geminiForward.text.trim();
 
-    const evaluationResponse =
-      await gemini.models.generateContent({
+    // Back Translation (Neutral Model)
+    const backPrompt = (translatedText) => `
+    Translate the following text back to ${detectedLang}.
+    Return ONLY the translated text.
+
+    Text:${translatedText}`;
+    const llamaBack = await gemini.models.generateContent({
+      model: "gemini-2.0-flash",
+      generationConfig: { temperature: 0 },
+      contents: backPrompt(llamaTranslation),
+    });
+
+    const geminiBack = await gemini.models.generateContent({
+      model: "gemini-2.0-flash",
+      generationConfig: { temperature: 0 },
+      contents: backPrompt(geminiTranslation),
+    });
+
+    const llamaBackText = llamaBack.text.trim();
+    const geminiBackText = geminiBack.text.trim();
+
+    // Similarity Evaluation Prompt
+    const judgePrompt = `
+      You are a strict semantic evaluator.
+
+      Original Text:
+      ${text}
+
+      Back Translation A:
+      ${llamaBackText}
+
+      Back Translation B:
+      ${geminiBackText}
+
+      Score similarity to the original text from 0 to 100.
+
+      Return ONLY JSON:
+      {
+        "scoreA": number,
+        "scoreB": number
+      }
+    `;
+    // Multi-Run Judges (3 Runs for Stability)
+
+    async function runGeminiJudge() {
+      const response = await gemini.models.generateContent({
         model: "gemini-2.0-flash",
         generationConfig: {
-          temperature: 0.0,
+          temperature: 0,
           responseMimeType: "application/json",
         },
-        contents: `
-          You are a strict professional translation evaluator.
-
-          Original Text:
-          ${text}
-
-          Detected Source Language:
-          ${detectedLang}
-
-          Target Language:
-          ${targetLanguage}
-
-          Translation A (LLM1):
-          ${llm1Translation}
-
-          Translation B (LLM2):
-          ${llm2Translation}
-
-          Tasks:
-          1. Back-translate both translations into ${detectedLang}.
-          2. Compare both back-translations with the original text.
-          3. Evaluate meaning preservation, fluency, and technical accuracy.
-          4. Decide which model is better.
-
-          Return ONLY JSON:
-          {
-            "backTranslationA": "...",
-            "backTranslationB": "...",
-            "scoreLLM1": number (0-100),
-            "scoreLLM2": number (0-100),
-            "winner": "LLM1 or LLM2",
-            "reasoning": "brief explanation"
-          }
-        `,
+        contents: judgePrompt,
       });
 
-    const evaluation = JSON.parse(
-      evaluationResponse.text.replace(/```json|```/g, "").trim()
-    );
+      return JSON.parse(
+        response.text.replace(/```json|```/g, "").trim()
+      );
+    }
+
+    async function runLlamaJudge() {
+      const response = await client.chat.completions.create({
+        model: "llama-3.1-8b-instant",
+        temperature: 0,
+        seed: 42,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a strict semantic evaluator. Return ONLY valid JSON.",
+          },
+          { role: "user", content: judgePrompt },
+        ],
+      });
+
+      return JSON.parse(
+        response.choices[0].message.content
+          .replace(/```json|```/g, "")
+          .trim()
+      );
+    }
+
+    const geminiResults = [];
+    const llamaResults = [];
+
+    for (let i = 0; i < 3; i++) {
+      geminiResults.push(await runGeminiJudge());
+      llamaResults.push(await runLlamaJudge());
+    }
+
+    const geminiScoreA =
+      geminiResults.reduce((sum, r) => sum + r.scoreA, 0) / 3;
+
+    const geminiScoreB =
+      geminiResults.reduce((sum, r) => sum + r.scoreB, 0) / 3;
+
+    const llamaScoreA =
+      llamaResults.reduce((sum, r) => sum + r.scoreA, 0) / 3;
+
+    const llamaScoreB =
+      llamaResults.reduce((sum, r) => sum + r.scoreB, 0) / 3;
+
+    // Final Averaging
+
+    const llamaFinal =
+      (geminiScoreA + llamaScoreA) / 2;
+
+    const geminiFinal =
+      (geminiScoreB + llamaScoreB) / 2;
+
+    let winner = "Tie";
+
+    if (llamaFinal > geminiFinal) {
+      winner = "Llama";
+    } else if (geminiFinal > llamaFinal) {
+      winner = "Gemini";
+    }
+
+    // Final Response
 
     res.json({
       detectedSourceLanguage: detectedLang,
       targetLanguage,
 
-      LLM1: {
-        forwardTranslation: llm1Translation,
+      forwardTranslations: {
+        Llama: llamaTranslation,
+        Gemini: geminiTranslation,
       },
 
-      LLM2: {
-        forwardTranslation: llm2Translation,
+      backTranslations: {
+        Llama: llamaBackText,
+        Gemini: geminiBackText,
       },
 
-      evaluation: {
-        ...evaluation,
-        winnerModel:
-          evaluation.winner === "LLM1"
-            ? "Llama (llama-3.1-8b-instant)"
-            : evaluation.winner === "LLM2"
-            ? "Gemini (gemini-2.0-flash)"
-            : "Tie",
+      judgeScores: {
+        GeminiJudgeAverage: {
+          Llama: Number(geminiScoreA.toFixed(2)),
+          Gemini: Number(geminiScoreB.toFixed(2)),
+        },
+        LlamaJudgeAverage: {
+          Llama: Number(llamaScoreA.toFixed(2)),
+          Gemini: Number(llamaScoreB.toFixed(2)),
+        },
       },
+
+      averageScores: {
+        Llama: Number(llamaFinal.toFixed(2)),
+        Gemini: Number(geminiFinal.toFixed(2)),
+      },
+
+      winner,
     });
 
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "Optimized translation comparison failed",
+      error: "Fair translation comparison failed",
     });
   }
 });
-
-
 
 app.listen(8000, () =>
   console.log("🚀 Groq Server running on http://localhost:8000")
